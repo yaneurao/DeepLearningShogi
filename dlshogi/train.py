@@ -26,6 +26,7 @@ def main(*argv):
     parser.add_argument('test_data', type=str, help='test data file')
     parser.add_argument('--batchsize', '-b', type=int, default=1024, help='Number of positions in each mini-batch')
     parser.add_argument('--testbatchsize', type=int, default=1024, help='Number of positions in each test mini-batch')
+    parser.add_argument('--grad-accum-batches', type=int, default=1, help='Number of mini-batches to accumulate before each optimizer step')
     parser.add_argument('--epoch', '-e', type=int, default=1, help='Number of epoch times')
     parser.add_argument('--network', default='resnet10_swish', help='network type')
     parser.add_argument('--checkpoint', default='checkpoint-{epoch:03}.pth', help='checkpoint file name')
@@ -64,6 +65,8 @@ def main(*argv):
     parser.add_argument('--patch', type=str, help='Overwrite with the hcpe')
     parser.add_argument('--cache', type=str, help='training data cache file')
     args = parser.parse_args(argv)
+    if args.grad_accum_batches < 1:
+        parser.error('--grad-accum-batches must be greater than or equal to 1')
 
     if args.log:
         logging.basicConfig(format='%(asctime)s\t%(levelname)s\t%(message)s', datefmt='%Y/%m/%d %H:%M:%S', filename=args.log, level=logging.DEBUG)
@@ -71,6 +74,8 @@ def main(*argv):
         logging.basicConfig(format='%(asctime)s\t%(levelname)s\t%(message)s', datefmt='%Y/%m/%d %H:%M:%S', stream=sys.stdout, level=logging.DEBUG)
     logging.info('network {}'.format(args.network))
     logging.info('batchsize={}'.format(args.batchsize))
+    if args.grad_accum_batches > 1:
+        logging.info('grad_accum_batches={}, effective_batchsize={}'.format(args.grad_accum_batches, args.batchsize * args.grad_accum_batches))
     logging.info('lr={}'.format(args.lr))
     logging.info('weight_decay={}'.format(args.weight_decay))
     if args.lr_scheduler:
@@ -220,10 +225,19 @@ def main(*argv):
     train_dataloader = Hcpe3DataLoader(train_data, args.batchsize, device, shuffle=True)
     test_dataloader = DataLoader(test_data, args.testbatchsize, device)
 
-    # for SWA update_bn
+    # for BN update
     def hcpe_loader(data, batchsize):
         for x1, x2, t1, t2, value in Hcpe3DataLoader(data, batchsize, device):
             yield { 'x1':x1, 'x2':x2 }
+
+    def update_batch_normalization(bn_model):
+        forward_ = bn_model.forward
+        bn_model.forward = lambda x : forward_(**x)
+        try:
+            with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
+                update_bn(hcpe_loader(train_data, args.batchsize), bn_model)
+        finally:
+            del bn_model.forward
 
     def accuracy(y, t):
         return (torch.max(y, 1)[1] == t).sum().item() / len(t)
@@ -317,81 +331,182 @@ def main(*argv):
         sum_loss2_epoch = 0
         sum_loss3_epoch = 0
         sum_loss_epoch = 0
-        for x1, x2, t1, t2, value in train_dataloader:
-            t += 1
-            steps += 1
-            with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
-                compiled_model.train()
+        if args.grad_accum_batches == 1:
+            for x1, x2, t1, t2, value in train_dataloader:
+                t += 1
+                steps += 1
+                with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
+                    compiled_model.train()
 
-                y1, y2 = compiled_model(x1, x2)
-
-                model.zero_grad()
-                loss1 = cross_entropy_loss_with_soft_target(y1, t1)
-                if args.use_critic:
-                    z = t2.view(-1) - value.view(-1) + 0.5
-                    loss1 = (loss1 * z).mean()
-                else:
-                    loss1 = loss1.mean()
-                if args.beta:
-                    loss1 += args.beta * (F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1).mean()
-                loss2 = bce_with_logits_loss(y2, t2)
-                loss3 = bce_with_logits_loss(y2, value)
-                loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
-
-            scaler.scale(loss).backward()
-            if args.clip_grad_max_norm:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_max_norm)
-            scaler.step(optimizer)
-            scaler.update()
-
-            if args.use_swa and epoch >= args.swa_start_epoch and t % args.swa_freq == 0:
-                swa_model.update_parameters(model)
-
-            sum_loss1 += loss1.item()
-            sum_loss2 += loss2.item()
-            sum_loss3 += loss3.item()
-            sum_loss += loss.item()
-
-            # print train loss
-            if t % eval_interval == 0:
-                compiled_model.eval()
-
-                x1, x2, t1, t2, value = test_dataloader.sample()
-                with torch.no_grad():
                     y1, y2 = compiled_model(x1, x2)
 
-                    loss1 = cross_entropy_loss(y1, t1).mean()
+                    model.zero_grad()
+                    loss1 = cross_entropy_loss_with_soft_target(y1, t1)
+                    if args.use_critic:
+                        z = t2.view(-1) - value.view(-1) + 0.5
+                        loss1 = (loss1 * z).mean()
+                    else:
+                        loss1 = loss1.mean()
+                    if args.beta:
+                        loss1 += args.beta * (F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1).mean()
                     loss2 = bce_with_logits_loss(y2, t2)
                     loss3 = bce_with_logits_loss(y2, value)
                     loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
 
-                    logging.info('epoch = {}, steps = {}, train loss = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test loss = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test accuracy = {:.07f}, {:.07f}'.format(
-                        epoch, t,
-                        sum_loss1 / steps, sum_loss2 / steps, sum_loss3 / steps, sum_loss / steps,
-                        loss1.item(), loss2.item(), loss3.item(), loss.item(),
-                        accuracy(y1, t1), binary_accuracy(y2, t2)))
+                scaler.scale(loss).backward()
+                if args.clip_grad_max_norm:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_max_norm)
+                scaler.step(optimizer)
+                scaler.update()
 
-                steps_epoch += steps
-                sum_loss1_epoch += sum_loss1
-                sum_loss2_epoch += sum_loss2
-                sum_loss3_epoch += sum_loss3
-                sum_loss_epoch += sum_loss
+                if args.use_swa and epoch >= args.swa_start_epoch and t % args.swa_freq == 0:
+                    swa_model.update_parameters(model)
 
-                steps = 0
-                sum_loss1 = 0
-                sum_loss2 = 0
-                sum_loss3 = 0
-                sum_loss = 0
+                sum_loss1 += loss1.item()
+                sum_loss2 += loss2.item()
+                sum_loss3 += loss3.item()
+                sum_loss += loss.item()
 
-            if args.lr_scheduler and args.scheduler_step_mode == 'step':
-                scheduler.step()
+                # print train loss
+                if t % eval_interval == 0:
+                    compiled_model.eval()
+
+                    x1, x2, t1, t2, value = test_dataloader.sample()
+                    with torch.no_grad():
+                        y1, y2 = compiled_model(x1, x2)
+
+                        loss1 = cross_entropy_loss(y1, t1).mean()
+                        loss2 = bce_with_logits_loss(y2, t2)
+                        loss3 = bce_with_logits_loss(y2, value)
+                        loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
+
+                        logging.info('epoch = {}, steps = {}, train loss = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test loss = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test accuracy = {:.07f}, {:.07f}'.format(
+                            epoch, t,
+                            sum_loss1 / steps, sum_loss2 / steps, sum_loss3 / steps, sum_loss / steps,
+                            loss1.item(), loss2.item(), loss3.item(), loss.item(),
+                            accuracy(y1, t1), binary_accuracy(y2, t2)))
+
+                    steps_epoch += steps
+                    sum_loss1_epoch += sum_loss1
+                    sum_loss2_epoch += sum_loss2
+                    sum_loss3_epoch += sum_loss3
+                    sum_loss_epoch += sum_loss
+
+                    steps = 0
+                    sum_loss1 = 0
+                    sum_loss2 = 0
+                    sum_loss3 = 0
+                    sum_loss = 0
+
+                if args.lr_scheduler and args.scheduler_step_mode == 'step':
+                    scheduler.step()
+        else:
+            train_batch_count = len(train_data) // args.batchsize
+            micro_batches = 0
+            accum_count = 0
+            accum_target = 0
+            accum_loss1 = 0
+            accum_loss2 = 0
+            accum_loss3 = 0
+            accum_loss = 0
+            for x1, x2, t1, t2, value in train_dataloader:
+                if accum_count == 0:
+                    model.zero_grad()
+                    accum_target = min(args.grad_accum_batches, train_batch_count - micro_batches)
+                    accum_loss1 = 0
+                    accum_loss2 = 0
+                    accum_loss3 = 0
+                    accum_loss = 0
+
+                micro_batches += 1
+                accum_count += 1
+                with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
+                    compiled_model.train()
+
+                    y1, y2 = compiled_model(x1, x2)
+
+                    loss1 = cross_entropy_loss_with_soft_target(y1, t1)
+                    if args.use_critic:
+                        z = t2.view(-1) - value.view(-1) + 0.5
+                        loss1 = (loss1 * z).mean()
+                    else:
+                        loss1 = loss1.mean()
+                    if args.beta:
+                        loss1 += args.beta * (F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1).mean()
+                    loss2 = bce_with_logits_loss(y2, t2)
+                    loss3 = bce_with_logits_loss(y2, value)
+                    loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
+
+                scaler.scale(loss / accum_target).backward()
+
+                accum_loss1 += loss1.item()
+                accum_loss2 += loss2.item()
+                accum_loss3 += loss3.item()
+                accum_loss += loss.item()
+
+                if accum_count == accum_target:
+                    if args.clip_grad_max_norm:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_max_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    t += 1
+                    steps += 1
+                    sum_loss1 += accum_loss1 / accum_count
+                    sum_loss2 += accum_loss2 / accum_count
+                    sum_loss3 += accum_loss3 / accum_count
+                    sum_loss += accum_loss / accum_count
+
+                    if args.use_swa and epoch >= args.swa_start_epoch and t % args.swa_freq == 0:
+                        swa_model.update_parameters(model)
+
+                    # print train loss
+                    if t % eval_interval == 0:
+                        compiled_model.eval()
+
+                        x1, x2, t1, t2, value = test_dataloader.sample()
+                        with torch.no_grad():
+                            y1, y2 = compiled_model(x1, x2)
+
+                            loss1 = cross_entropy_loss(y1, t1).mean()
+                            loss2 = bce_with_logits_loss(y2, t2)
+                            loss3 = bce_with_logits_loss(y2, value)
+                            loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
+
+                            logging.info('epoch = {}, steps = {}, train loss = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test loss = {:.07f}, {:.07f}, {:.07f}, {:.07f}, test accuracy = {:.07f}, {:.07f}'.format(
+                                epoch, t,
+                                sum_loss1 / steps, sum_loss2 / steps, sum_loss3 / steps, sum_loss / steps,
+                                loss1.item(), loss2.item(), loss3.item(), loss.item(),
+                                accuracy(y1, t1), binary_accuracy(y2, t2)))
+
+                        steps_epoch += steps
+                        sum_loss1_epoch += sum_loss1
+                        sum_loss2_epoch += sum_loss2
+                        sum_loss3_epoch += sum_loss3
+                        sum_loss_epoch += sum_loss
+
+                        steps = 0
+                        sum_loss1 = 0
+                        sum_loss2 = 0
+                        sum_loss3 = 0
+                        sum_loss = 0
+
+                    if args.lr_scheduler and args.scheduler_step_mode == 'step':
+                        scheduler.step()
+
+                    accum_count = 0
 
         steps_epoch += steps
         sum_loss1_epoch += sum_loss1
         sum_loss2_epoch += sum_loss2
         sum_loss3_epoch += sum_loss3
         sum_loss_epoch += sum_loss
+
+        if args.grad_accum_batches > 1:
+            logging.info('Updating batch normalization')
+            update_batch_normalization(model)
 
         # print train loss and test loss for each epoch
         test_loss1, test_loss2, test_loss3, test_loss, test_accuracy1, test_accuracy2, test_entropy1, test_entropy2 = test(compiled_model)
@@ -414,11 +529,7 @@ def main(*argv):
     if args.model:
         if args.use_swa and epoch >= args.swa_start_epoch:
             logging.info('Updating batch normalization')
-            forward_ = swa_model.forward
-            swa_model.forward = lambda x : forward_(**x)
-            with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
-                update_bn(hcpe_loader(train_data, args.batchsize), swa_model)
-            del swa_model.forward
+            update_batch_normalization(swa_model)
 
             # print test loss with swa model
             test_loss1, test_loss2, test_loss3, test_loss, test_accuracy1, test_accuracy2, test_entropy1, test_entropy2 = test(swa_model)
