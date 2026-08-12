@@ -26,7 +26,7 @@ def main(*argv):
     parser.add_argument('test_data', type=str, help='test data file')
     parser.add_argument('--batchsize', '-b', type=int, default=1024, help='Number of positions in each mini-batch')
     parser.add_argument('--testbatchsize', type=int, default=1024, help='Number of positions in each test mini-batch')
-    parser.add_argument('--grad-accum-batches', type=int, default=1, help='Number of mini-batches to accumulate before each optimizer step')
+    parser.add_argument('--batches-per-update', type=int, default=1, help='Number of mini-batches to process before each optimizer step')
     parser.add_argument('--epoch', '-e', type=int, default=1, help='Number of epoch times')
     parser.add_argument('--network', default='resnet10_swish', help='network type')
     parser.add_argument('--checkpoint', default='checkpoint-{epoch:03}.pth', help='checkpoint file name')
@@ -65,8 +65,8 @@ def main(*argv):
     parser.add_argument('--patch', type=str, help='Overwrite with the hcpe')
     parser.add_argument('--cache', type=str, help='training data cache file')
     args = parser.parse_args(argv)
-    if args.grad_accum_batches < 1:
-        parser.error('--grad-accum-batches must be greater than or equal to 1')
+    if args.batches_per_update < 1:
+        parser.error('--batches-per-update must be greater than or equal to 1')
 
     if args.log:
         logging.basicConfig(format='%(asctime)s\t%(levelname)s\t%(message)s', datefmt='%Y/%m/%d %H:%M:%S', filename=args.log, level=logging.DEBUG)
@@ -74,8 +74,8 @@ def main(*argv):
         logging.basicConfig(format='%(asctime)s\t%(levelname)s\t%(message)s', datefmt='%Y/%m/%d %H:%M:%S', stream=sys.stdout, level=logging.DEBUG)
     logging.info('network {}'.format(args.network))
     logging.info('batchsize={}'.format(args.batchsize))
-    if args.grad_accum_batches > 1:
-        logging.info('grad_accum_batches={}, effective_batchsize={}'.format(args.grad_accum_batches, args.batchsize * args.grad_accum_batches))
+    if args.batches_per_update > 1:
+        logging.info('batches_per_update={}, effective_batchsize={}'.format(args.batches_per_update, args.batchsize * args.batches_per_update))
     logging.info('lr={}'.format(args.lr))
     logging.info('weight_decay={}'.format(args.weight_decay))
     if args.lr_scheduler:
@@ -331,7 +331,7 @@ def main(*argv):
         sum_loss2_epoch = 0
         sum_loss3_epoch = 0
         sum_loss_epoch = 0
-        if args.grad_accum_batches == 1:
+        if args.batches_per_update == 1:
             for x1, x2, t1, t2, value in train_dataloader:
                 t += 1
                 steps += 1
@@ -413,7 +413,7 @@ def main(*argv):
             for x1, x2, t1, t2, value in train_dataloader:
                 if accum_count == 0:
                     model.zero_grad()
-                    accum_target = min(args.grad_accum_batches, train_batch_count - micro_batches)
+                    accum_target = min(args.batches_per_update, train_batch_count - micro_batches)
                     accum_loss1 = 0
                     accum_loss2 = 0
                     accum_loss3 = 0
@@ -504,7 +504,7 @@ def main(*argv):
         sum_loss3_epoch += sum_loss3
         sum_loss_epoch += sum_loss
 
-        if args.grad_accum_batches > 1:
+        if args.batches_per_update > 1:
             logging.info('Updating batch normalization')
             update_batch_normalization(model)
 
