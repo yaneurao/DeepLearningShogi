@@ -189,6 +189,7 @@ def main(*argv):
         t = 0
 
     compiled_model = model
+    compile_uses_cudagraphs = False
     if args.use_compile:
         if not hasattr(torch, 'compile'):
             raise RuntimeError('torch.compile is not available. Please use PyTorch 2.0 or later.')
@@ -199,18 +200,46 @@ def main(*argv):
             compile_backend = 'aot_eager'
         if compile_backend:
             compile_kwargs['backend'] = compile_backend
-        if args.compile_mode:
-            compile_kwargs['mode'] = args.compile_mode
+        compile_mode = args.compile_mode
+        compile_options = None
+        if (
+            args.batches_per_update > 1
+            and compile_backend == 'inductor'
+            and compile_mode in ('reduce-overhead', 'max-autotune')
+        ):
+            if compile_mode == 'max-autotune':
+                logging.warning(
+                    'torch.compile mode=max-autotune uses CUDA Graphs, '
+                    'which is incompatible with --batches-per-update > 1; '
+                    'using mode=max-autotune-no-cudagraphs instead'
+                )
+                compile_mode = 'max-autotune-no-cudagraphs'
+            else:
+                logging.warning(
+                    'torch.compile mode=reduce-overhead uses CUDA Graphs, '
+                    'which is incompatible with --batches-per-update > 1; '
+                    'disabling CUDA Graphs for this run'
+                )
+                compile_mode = None
+                compile_options = {'triton.cudagraphs': False}
+        if compile_mode:
+            compile_kwargs['mode'] = compile_mode
+        if compile_options:
+            compile_kwargs['options'] = compile_options
         if args.compile_fullgraph:
             compile_kwargs['fullgraph'] = True
         if args.compile_dynamic:
             compile_kwargs['dynamic'] = True
+        compile_uses_cudagraphs = (
+            compile_backend == 'inductor'
+            and compile_mode in ('reduce-overhead', 'max-autotune')
+        )
 
         logging.info('use torch.compile({})'.format(', '.join(f'{key}={value}' for key, value in compile_kwargs.items())))
         compiled_model = torch.compile(model, **compile_kwargs)
 
     cudagraph_mark_step_begin = None
-    if args.use_compile and hasattr(torch, 'compiler'):
+    if compile_uses_cudagraphs and hasattr(torch, 'compiler'):
         cudagraph_mark_step_begin = getattr(torch.compiler, 'cudagraph_mark_step_begin', None)
         if cudagraph_mark_step_begin:
             logging.info('torch.compile cudagraph step marker enabled')
