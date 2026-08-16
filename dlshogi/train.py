@@ -209,6 +209,17 @@ def main(*argv):
         logging.info('use torch.compile({})'.format(', '.join(f'{key}={value}' for key, value in compile_kwargs.items())))
         compiled_model = torch.compile(model, **compile_kwargs)
 
+    cudagraph_mark_step_begin = None
+    if args.use_compile and hasattr(torch, 'compiler'):
+        cudagraph_mark_step_begin = getattr(torch.compiler, 'cudagraph_mark_step_begin', None)
+        if cudagraph_mark_step_begin:
+            logging.info('torch.compile cudagraph step marker enabled')
+
+    def forward_model(x1, x2):
+        if cudagraph_mark_step_begin:
+            cudagraph_mark_step_begin()
+        return compiled_model(x1, x2)
+
     logging.info('optimizer {}'.format(re.sub(' +', ' ', str(optimizer).replace('\n', ''))))
 
     logging.info('Reading training data')
@@ -260,7 +271,10 @@ def main(*argv):
         eval_model.eval()
         with torch.no_grad():
             for x1, x2, t1, t2, value in test_dataloader:
-                y1, y2 = eval_model(x1, x2)
+                if eval_model is compiled_model:
+                    y1, y2 = forward_model(x1, x2)
+                else:
+                    y1, y2 = eval_model(x1, x2)
 
                 steps += 1
                 loss1 = cross_entropy_loss(y1, t1).mean()
@@ -338,7 +352,7 @@ def main(*argv):
                 with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
                     compiled_model.train()
 
-                    y1, y2 = compiled_model(x1, x2)
+                    y1, y2 = forward_model(x1, x2)
 
                     model.zero_grad()
                     loss1 = cross_entropy_loss_with_soft_target(y1, t1)
@@ -374,7 +388,7 @@ def main(*argv):
 
                     x1, x2, t1, t2, value = test_dataloader.sample()
                     with torch.no_grad():
-                        y1, y2 = compiled_model(x1, x2)
+                        y1, y2 = forward_model(x1, x2)
 
                         loss1 = cross_entropy_loss(y1, t1).mean()
                         loss2 = bce_with_logits_loss(y2, t2)
@@ -424,7 +438,7 @@ def main(*argv):
                 with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
                     compiled_model.train()
 
-                    y1, y2 = compiled_model(x1, x2)
+                    y1, y2 = forward_model(x1, x2)
 
                     loss1 = cross_entropy_loss_with_soft_target(y1, t1)
                     if args.use_critic:
@@ -468,7 +482,7 @@ def main(*argv):
 
                         x1, x2, t1, t2, value = test_dataloader.sample()
                         with torch.no_grad():
-                            y1, y2 = compiled_model(x1, x2)
+                            y1, y2 = forward_model(x1, x2)
 
                             loss1 = cross_entropy_loss(y1, t1).mean()
                             loss2 = bce_with_logits_loss(y2, t2)
