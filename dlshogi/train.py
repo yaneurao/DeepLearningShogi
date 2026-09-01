@@ -165,8 +165,14 @@ def main(*argv):
         if 'model' in checkpoint:
             logging.info('Loading the checkpoint from {}'.format(args.resume))
             model.load_state_dict(checkpoint['model'])
-            if args.use_swa and 'swa_model' in checkpoint:
-                swa_model.load_state_dict(checkpoint['swa_model'])
+            if args.use_swa:
+                if 'swa_model' in checkpoint:
+                    swa_model.load_state_dict(checkpoint['swa_model'])
+                else:
+                    # swa_modelはresume前のmodelで構築されているため、checkpointにSWA状態が
+                    # ない場合はresume後のmodelで初期化し直す。これをしないとswa_start_epoch
+                    # 到達時に初期modelと学習済みmodelが混ざり、policy/valueが壊れる。
+                    swa_model.load_state_dict(model.state_dict())
             if not args.reset_optimizer:
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 if not args.lr_scheduler:
@@ -585,7 +591,7 @@ def main(*argv):
 
         model_path = args.model.format(**{'epoch':epoch, 'step':t})
         logging.info('Saving the model to {}'.format(model_path))
-        serializers.save_npz(model_path, swa_model.module if args.use_swa else model)
+        serializers.save_npz(model_path, swa_model.module if args.use_swa and epoch >= args.swa_start_epoch else model)
 
 if __name__ == '__main__':
     main(*sys.argv[1:])
