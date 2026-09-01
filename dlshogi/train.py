@@ -27,6 +27,7 @@ def main(*argv):
     parser.add_argument('--batchsize', '-b', type=int, default=1024, help='Number of positions in each mini-batch')
     parser.add_argument('--testbatchsize', type=int, default=1024, help='Number of positions in each test mini-batch')
     parser.add_argument('--batches-per-update', type=int, default=1, help='Number of mini-batches to process before each optimizer step')
+    parser.add_argument('--large-batch-bn', action='store_true', help='Use effective-batch BatchNorm statistics when --batches-per-update is greater than 1')
     parser.add_argument('--epoch', '-e', type=int, default=1, help='Number of epoch times')
     parser.add_argument('--network', default='resnet10_swish', help='network type')
     parser.add_argument('--checkpoint', default='checkpoint-{epoch:03}.pth', help='checkpoint file name')
@@ -76,6 +77,10 @@ def main(*argv):
     logging.info('batchsize={}'.format(args.batchsize))
     if args.batches_per_update > 1:
         logging.info('batches_per_update={}, effective_batchsize={}'.format(args.batches_per_update, args.batchsize * args.batches_per_update))
+        if args.large_batch_bn:
+            logging.info('large_batch_bn enabled')
+            if args.use_compile:
+                logging.info('large_batch_bn uses the uncompiled model for training passes')
     logging.info('lr={}'.format(args.lr))
     logging.info('weight_decay={}'.format(args.weight_decay))
     if args.lr_scheduler:
@@ -279,6 +284,90 @@ def main(*argv):
         finally:
             del bn_model.forward
 
+    def batch_norm_modules(bn_model):
+        return [m for m in bn_model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+
+    def set_batch_norm_training(modules, training):
+        states = [(m, m.training) for m in modules]
+        for m in modules:
+            m.training = training
+        return states
+
+    def restore_batch_norm_training(states):
+        for m, training in states:
+            m.training = training
+
+    def collect_large_batch_bn_stats(forward_model, loader, index_batches):
+        modules = batch_norm_modules(model)
+        if not modules:
+            return {}
+
+        collected = {}
+        for target in modules:
+            stats = {
+                'sum': torch.zeros(target.num_features, device=device, dtype=torch.float32),
+                'sum_sq': torch.zeros(target.num_features, device=device, dtype=torch.float32),
+                'count': 0,
+            }
+
+            def hook(_module, inputs):
+                x = inputs[0].detach().float()
+                dims = [0] + list(range(2, x.dim()))
+                stats['sum'] += x.sum(dim=dims)
+                stats['sum_sq'] += (x * x).sum(dim=dims)
+                stats['count'] += x.numel() // x.size(1)
+
+            handle = target.register_forward_pre_hook(hook)
+            forward_model.train()
+            bn_states = use_large_batch_bn_stats(collected)
+            disabled_bn_states = set_batch_norm_training(modules, False)
+            try:
+                with torch.no_grad():
+                    for index in index_batches:
+                        x1, x2, _t1, _t2, _value = loader.mini_batch(index)
+                        with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
+                            forward_model(x1, x2)
+            finally:
+                restore_batch_norm_training(disabled_bn_states)
+                restore_large_batch_bn_stats(bn_states)
+                handle.remove()
+
+            if stats['count'] == 0:
+                continue
+            mean = stats['sum'] / stats['count']
+            var = stats['sum_sq'] / stats['count'] - mean * mean
+            collected[target] = (mean, torch.clamp(var, min=0))
+        return collected
+
+    def use_large_batch_bn_stats(stats):
+        states = []
+        for m, (mean, var) in stats.items():
+            states.append((m, m.training, m.running_mean.detach().clone(), m.running_var.detach().clone()))
+            m.running_mean.detach().copy_(mean)
+            m.running_var.detach().copy_(var)
+            m.training = False
+        return states
+
+    def restore_large_batch_bn_stats(states):
+        for m, training, running_mean, running_var in states:
+            m.running_mean.detach().copy_(running_mean)
+            m.running_var.detach().copy_(running_var)
+            m.training = training
+
+    def iter_effective_index_batches(data):
+        np.random.shuffle(data)
+        train_batch_count = len(data) // args.batchsize
+        micro_batch_count = 0
+        while micro_batch_count < train_batch_count:
+            accum_target = min(args.batches_per_update, train_batch_count - micro_batch_count)
+            index_batches = []
+            for _ in range(accum_target):
+                start = micro_batch_count * args.batchsize
+                end = start + args.batchsize
+                index_batches.append(data[start:end])
+                micro_batch_count += 1
+            yield index_batches
+
     def accuracy(y, t):
         return (torch.max(y, 1)[1] == t).sum().item() / len(t)
 
@@ -445,6 +534,8 @@ def main(*argv):
                 if args.lr_scheduler and args.scheduler_step_mode == 'step':
                     scheduler.step()
         else:
+            large_batch_bn_loader = Hcpe3DataLoader(train_data, args.batchsize, device, shuffle=False) if args.large_batch_bn else None
+            train_iterator = iter_effective_index_batches(train_data) if args.large_batch_bn else train_dataloader
             train_batch_count = len(train_data) // args.batchsize
             micro_batches = 0
             accum_count = 0
@@ -453,40 +544,60 @@ def main(*argv):
             accum_loss2 = 0
             accum_loss3 = 0
             accum_loss = 0
-            for x1, x2, t1, t2, value in train_dataloader:
+            for batch_item in train_iterator:
                 if accum_count == 0:
                     model.zero_grad()
-                    accum_target = min(args.batches_per_update, train_batch_count - micro_batches)
+                    accum_target = len(batch_item) if args.large_batch_bn else min(args.batches_per_update, train_batch_count - micro_batches)
                     accum_loss1 = 0
                     accum_loss2 = 0
                     accum_loss3 = 0
                     accum_loss = 0
 
-                micro_batches += 1
-                accum_count += 1
-                with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
-                    compiled_model.train()
+                bn_stat_states = None
+                if args.large_batch_bn:
+                    bn_stats = collect_large_batch_bn_stats(model, large_batch_bn_loader, batch_item)
+                    bn_stat_states = use_large_batch_bn_stats(bn_stats)
+                    micro_batch_iter = (large_batch_bn_loader.mini_batch(index) for index in batch_item)
+                else:
+                    micro_batch_iter = (batch_item,)
 
-                    y1, y2 = forward_model(x1, x2)
+                try:
+                    for x1, x2, t1, t2, value in micro_batch_iter:
+                        micro_batches += 1
+                        accum_count += 1
+                        with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
+                            if args.large_batch_bn:
+                                model.train()
+                                # Keep BatchNorm on the effective-batch statistics collected above.
+                                for m in bn_stats:
+                                    m.training = False
+                                y1, y2 = model(x1, x2)
+                            else:
+                                compiled_model.train()
+                                y1, y2 = forward_model(x1, x2)
 
-                    loss1 = cross_entropy_loss_with_soft_target(y1, t1)
-                    if args.use_critic:
-                        z = t2.view(-1) - value.view(-1) + 0.5
-                        loss1 = (loss1 * z).mean()
-                    else:
-                        loss1 = loss1.mean()
-                    if args.beta:
-                        loss1 += args.beta * (F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1).mean()
-                    loss2 = bce_with_logits_loss(y2, t2)
-                    loss3 = bce_with_logits_loss(y2, value)
-                    loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
 
-                scaler.scale(loss / accum_target).backward()
+                            loss1 = cross_entropy_loss_with_soft_target(y1, t1)
+                            if args.use_critic:
+                                z = t2.view(-1) - value.view(-1) + 0.5
+                                loss1 = (loss1 * z).mean()
+                            else:
+                                loss1 = loss1.mean()
+                            if args.beta:
+                                loss1 += args.beta * (F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1).mean()
+                            loss2 = bce_with_logits_loss(y2, t2)
+                            loss3 = bce_with_logits_loss(y2, value)
+                            loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
 
-                accum_loss1 += loss1.item()
-                accum_loss2 += loss2.item()
-                accum_loss3 += loss3.item()
-                accum_loss += loss.item()
+                        scaler.scale(loss / accum_target).backward()
+
+                        accum_loss1 += loss1.item()
+                        accum_loss2 += loss2.item()
+                        accum_loss3 += loss3.item()
+                        accum_loss += loss.item()
+                finally:
+                    if bn_stat_states is not None:
+                        restore_large_batch_bn_stats(bn_stat_states)
 
                 if accum_count == accum_target:
                     if args.clip_grad_max_norm:
