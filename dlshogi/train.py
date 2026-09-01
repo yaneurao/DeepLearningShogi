@@ -68,6 +68,12 @@ def main(*argv):
     args = parser.parse_args(argv)
     if args.batches_per_update < 1:
         parser.error('--batches-per-update must be greater than or equal to 1')
+    if args.large_batch_bn:
+        parser.error(
+            '--large-batch-bn is disabled: the previous implementation used '
+            'fixed BatchNorm statistics per micro-batch, which does not match '
+            'large-batch BatchNorm backward and can corrupt training'
+        )
 
     if args.log:
         logging.basicConfig(format='%(asctime)s\t%(levelname)s\t%(message)s', datefmt='%Y/%m/%d %H:%M:%S', filename=args.log, level=logging.DEBUG)
