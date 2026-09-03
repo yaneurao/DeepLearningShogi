@@ -172,7 +172,7 @@ def main(*argv):
                     # swa_modelはresume前のmodelで構築されているため、checkpointにSWA状態が
                     # ない場合はresume後のmodelで初期化し直す。これをしないとswa_start_epoch
                     # 到達時に初期modelと学習済みmodelが混ざり、policy/valueが壊れる。
-                    swa_model.load_state_dict(model.state_dict())
+                    swa_model.module.load_state_dict(model.state_dict())
             if not args.reset_optimizer:
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 if not args.lr_scheduler:
