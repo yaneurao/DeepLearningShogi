@@ -140,6 +140,9 @@ def main(*argv):
         ema_b = 1 / (args.swa_n_avr + 1)
         ema_avg = lambda averaged_model_parameter, model_parameter, num_averaged : ema_a * averaged_model_parameter + ema_b * model_parameter
         swa_model = AveragedModel(model, avg_fn=ema_avg)
+        swa_freq_updates = max(1, math.ceil(args.swa_freq / args.batches_per_update))
+        if args.batches_per_update > 1:
+            logging.info(f'swa update frequency with gradient accumulation: every {swa_freq_updates} optimizer updates')
     def cross_entropy_loss_with_soft_target(pred, soft_targets):
         return torch.sum(-soft_targets * F.log_softmax(pred, dim=1), 1)
     cross_entropy_loss = torch.nn.CrossEntropyLoss(reduction='none')
@@ -508,7 +511,7 @@ def main(*argv):
                     sum_loss3 += accum_loss3 / accum_count
                     sum_loss += accum_loss / accum_count
 
-                    if args.use_swa and epoch >= args.swa_start_epoch and t % args.swa_freq == 0:
+                    if args.use_swa and epoch >= args.swa_start_epoch and t % swa_freq_updates == 0:
                         swa_model.update_parameters(model)
 
                     # print train loss
