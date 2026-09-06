@@ -328,6 +328,30 @@ inline void visits_to_proberbility(TrainingData& data, const std::vector<MoveVis
     }
 }
 
+template <bool add>
+inline void set_policy_target(TrainingData& data, const std::vector<MoveVisits>& candidates,
+    const double temperature, const u16 selected, const double policy_mix) {
+    if (policy_mix == 1.0) {
+        visits_to_proberbility<add>(data, candidates, temperature);
+        return;
+    }
+    // Mix per record before duplicate-position averaging, using the played move,
+    // which need not be the most visited move.
+    TrainingData target;
+    if (policy_mix > 0) {
+        visits_to_proberbility<false>(target, candidates, temperature);
+        for (auto& entry : target.candidates)
+            entry.second *= policy_mix;
+    }
+    target.candidates[selected] += 1.0 - policy_mix;
+    for (const auto& entry : target.candidates) {
+        if constexpr (add)
+            data.candidates[entry.first] += entry.second;
+        else
+            data.candidates[entry.first] = entry.second;
+    }
+}
+
 // フォーマット自動判別
 bool is_hcpe(std::ifstream& ifs) {
     if (ifs.tellg() % sizeof(HuffmanCodedPosAndEval) == 0) {
@@ -344,7 +368,7 @@ bool is_hcpe(std::ifstream& ifs) {
 
 // hcpe3形式のデータを読み込み、ランダムアクセス可能なように加工し、trainingDataに保存する
 // 複数回呼ぶことで、複数ファイルの読み込みが可能
-size_t __load_hcpe3(const std::string& filepath, bool use_average, double a, double temperature, size_t& len) {
+size_t __load_hcpe3(const std::string& filepath, bool use_average, double a, double temperature, size_t& len, double policy_mix) {
     std::ifstream ifs(filepath, std::ifstream::binary | std::ios::ate);
     if (!ifs) return trainingData.size();
 
@@ -402,14 +426,14 @@ size_t __load_hcpe3(const std::string& filepath, bool use_average, double a, dou
                                 value,
                                 make_result(hcpe3.result, pos.turn())
                             );
-                            visits_to_proberbility<false>(data, candidates, temperature);
+                            set_policy_target<false>(data, candidates, temperature, moveInfo.selectedMove16, policy_mix);
                         }
                         else {
                             // 重複データの場合、加算する(hcpe3_decode_with_valueで平均にする)
                             auto& data = trainingData[ret.first->second];
                             data.value += value;
                             data.result += make_result(hcpe3.result, pos.turn());
-                            visits_to_proberbility<true>(data, candidates, temperature);
+                            set_policy_target<true>(data, candidates, temperature, moveInfo.selectedMove16, policy_mix);
                             data.count++;
 
                         }
@@ -420,7 +444,7 @@ size_t __load_hcpe3(const std::string& filepath, bool use_average, double a, dou
                             value,
                             make_result(hcpe3.result, pos.turn())
                         );
-                        visits_to_proberbility<false>(data, candidates, temperature);
+                        set_policy_target<false>(data, candidates, temperature, moveInfo.selectedMove16, policy_mix);
                     }
                     ++len;
                 }

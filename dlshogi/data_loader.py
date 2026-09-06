@@ -184,7 +184,12 @@ class Hcpe3DataLoader(DataLoader):
         patch=None,
         cache=None,
         logger=logging,
+        policy_mix=1.0,
     ):
+        if not 0.0 <= policy_mix <= 1.0:
+            raise ValueError("policy_mix must be between 0 and 1")
+        if cache and policy_mix != 1.0:
+            raise ValueError("policy_mix != 1 cannot be used with cache (selected moves are not retained)")
         # キャッシュが存在する場合、キャッシュから読み込む
         if cache and os.path.isfile(cache):
             logger.info("Load cache {}".format(cache))
@@ -209,7 +214,10 @@ class Hcpe3DataLoader(DataLoader):
                 else:
                     a = 0
                     logger.info(path)
-                sum_len, len_ = cppshogi.load_hcpe3(path, use_average, a, temperature)
+                if policy_mix == 1.0:
+                    sum_len, len_ = cppshogi.load_hcpe3(path, use_average, a, temperature)
+                else:
+                    sum_len, len_ = cppshogi.load_hcpe3(path, use_average, a, temperature, policy_mix)
                 if len_ == 0:
                     raise RuntimeError("read error {}".format(path))
                 actual_len += len_

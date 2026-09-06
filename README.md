@@ -14,6 +14,22 @@ http://tadaoyamaoka.hatenablog.com/
 
 最新のモデルファイルは、[棋神アナリティクス](https://kishin-analytics.heroz.jp/lp/)でご利用いただけます。
 
+## Policy教師の混合
+
+`dlshogi.train`の`--policy-mix`は、HCPE3の選択手だけの正解分布と、visitNumから作る分布を混ぜる比率です。
+範囲は0〜1、既定値は1（従来動作）です。`--temperature`を適用した後の分布に対して、
+`(1-policy_mix) * one_hot(selectedMove16) + policy_mix * visit_distribution`を各レコードで計算し、その後で重複局面を平均します。
+0は選択手だけ、0.1は選択手90%とvisit分布10%、1はvisit分布だけです。
+選択手が最大visitNumの手と異なる棋譜では、temperature=0とpolicy-mix=0は異なります。
+hcpe教師、value教師、テストの採点は変更しません。既存キャッシュは選択手を保持しないため、1以外は`--cache`と併用できません。
+
+```powershell
+python setup.py build_ext --inplace --force
+python -m dlshogi.train train.hcpe3 test.hcpe --temperature 0.1 --policy-mix 0.1
+```
+
+更新後はC++拡張モジュールの再ビルドが必要です。対応するC++コンパイラ、Cython、NumPy、setuptoolsのあるPython環境で実行してください。
+
 ## ソース構成
 |フォルダ|説明|
 |:---|:---|

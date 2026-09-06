@@ -63,9 +63,15 @@ def main(*argv):
     parser.add_argument('--use_average', action='store_true')
     parser.add_argument('--use_evalfix', action='store_true')
     parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--policy-mix', type=float, default=1.0,
+                        help='Weight of the visit distribution versus the selected-move target (0 to 1).')
     parser.add_argument('--patch', type=str, help='Overwrite with the hcpe')
     parser.add_argument('--cache', type=str, help='training data cache file')
     args = parser.parse_args(argv)
+    if not 0.0 <= args.policy_mix <= 1.0:
+        parser.error('--policy-mix must be between 0 and 1')
+    if args.cache and args.policy_mix != 1.0:
+        parser.error('--policy-mix other than 1 cannot be used with --cache')
     if args.batches_per_update < 1:
         parser.error('--batches-per-update must be greater than or equal to 1')
 
@@ -156,6 +162,7 @@ def main(*argv):
     if args.use_evalfix:
         logging.info('use evalfix')
     logging.info('temperature={}'.format(args.temperature))
+    logging.info('policy_mix={}'.format(args.policy_mix))
 
     # Init/Resume
     if args.initmodel:
@@ -262,7 +269,7 @@ def main(*argv):
     logging.info('optimizer {}'.format(re.sub(' +', ' ', str(optimizer).replace('\n', ''))))
 
     logging.info('Reading training data')
-    train_len, actual_len = Hcpe3DataLoader.load_files(args.train_data, args.use_average, args.use_evalfix, args.temperature, args.patch, args.cache)
+    train_len, actual_len = Hcpe3DataLoader.load_files(args.train_data, args.use_average, args.use_evalfix, args.temperature, args.patch, args.cache, policy_mix=args.policy_mix)
     train_data = np.arange(train_len, dtype=np.uint64)
     logging.info('Reading test data')
     test_data = np.fromfile(args.test_data, dtype=HuffmanCodedPosAndEval)
