@@ -14,6 +14,30 @@ http://tadaoyamaoka.hatenablog.com/
 
 最新のモデルファイルは、[棋神アナリティクス](https://kishin-analytics.heroz.jp/lp/)でご利用いただけます。
 
+## Value lossの重み付け
+
+`dlshogi.train --value-loss-min-weight 0.5`は、教師評価値から変換された期待勝率`q`に応じて
+各局面のvalue lossを重み付けします。範囲は0～1、デフォルトは1（従来通り）です。
+
+```text
+w = a + (1 - a) * 4 * q * (1 - q)
+value loss = sum(w * ((1 - val_lambda) * BCE(result) + val_lambda * BCE(q))) / sum(w)
+```
+
+`a`が指定値です。中央`q=0.5`で重み1、端`q=0,1`で重み`a`になります。
+`q`にはデータローダーの教師value（evalfix有効時は補正後）を使い、学習中のモデル予測値や
+勝敗ラベルからは重みを計算しません。HCPE・HCPE3の両方に適用します。
+policy loss、通常モデル・SWAモデルのテストlossとaccuracyは変更しません。
+
+`--batches-per-update`併用時は、更新1回分の全ミニバッチを通した重み合計で正規化します。
+現在のローダーと同じく不完全なミニバッチは扱わず、末尾の蓄積グループは実際のバッチ数を使います。
+重み合計が0の場合はvalue勾配を0とし、policyの学習は継続します。
+`a=1`では従来の計算経路を維持します。`a<1`かつ勾配蓄積時は、policyとvalueの逆伝播を
+分けて計算しvalue勾配を別バッファに保持するため、追加の計算時間とモデル勾配相当のメモリが必要です。
+ミニバッチの入力や計算グラフを蓄積数分保持することはありません。
+
+この変更はPythonのみで、ネイティブ拡張の再ビルドは不要です。
+
 ## Policy教師の混合
 
 `dlshogi.train`の`--policy-mix`は、HCPE3の選択手だけの正解分布と、visitNumから作る分布を混ぜる比率です。
