@@ -175,6 +175,9 @@ def score_to_value(score, a):
 
 
 class Hcpe3DataLoader(DataLoader):
+    def value_weight_mean(self, start, count, minimum):
+        return cppshogi.hcpe3_value_weight_mean(self.data[start:start + count], minimum)
+
     @staticmethod
     def load_files(
         files,

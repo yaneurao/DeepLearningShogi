@@ -10,7 +10,7 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from dlshogi.value_loss import weighted_value_losses, positive_denominator, ValueGradientAccumulator
+from dlshogi.value_loss import weighted_value_losses, positive_denominator
 
 
 class TinyNetwork(torch.nn.Module):
@@ -30,6 +30,7 @@ class ValueLossTest(unittest.TestCase):
         # Native shogi decoding is replaced with tiny deterministic batches only.
         native = ModuleType('dlshogi.cppshogi')
         native.get_max_features2_nyugyoku_num = lambda: 0
+        native.hcpe3_value_weight_mean = lambda *args: None
         with patch.dict(sys.modules, {'dlshogi.cppshogi': native}):
             train = importlib.import_module('dlshogi.train')
         torch.manual_seed(77)
@@ -45,6 +46,10 @@ class ValueLossTest(unittest.TestCase):
 
             def __init__(self, *args, **kwargs):
                 pass
+
+            def value_weight_mean(self, start, count, minimum):
+                values = q[start:start+count]
+                return (minimum + (1-minimum)*4*values*(1-values)).mean().item()
 
             def __iter__(self):
                 for i in range(0, 8, 2):
@@ -88,6 +93,10 @@ class ValueLossTest(unittest.TestCase):
         for invalid in ('-1', '1.01', 'nan', 'inf'):
             with patch('sys.stderr', new=io.StringIO()), self.assertRaises(SystemExit):
                 train.main('train.hcpe3', 'test.hcpe', '--value-loss-min-weight', invalid)
+        with patch.object(train, 'cppshogi', ModuleType('old_extension')), \
+                patch('sys.stderr', new=io.StringIO()) as stderr, self.assertRaises(SystemExit):
+            train.main('train.hcpe3', 'test.hcpe', '--value-loss-min-weight', '.5', '--batches-per-update', '2')
+        self.assertIn('build_ext --inplace --force', stderr.getvalue())
 
     def test_formula_and_detached_teacher(self):
         q = torch.tensor([[0.], [.25], [.5], [.75], [1.]], requires_grad=True)
@@ -118,14 +127,13 @@ class ValueLossTest(unittest.TestCase):
                         expected_loss.backward()
                         scaler = torch.amp.GradScaler('cpu', enabled=scaled)
                         optimizer = torch.optim.SGD(model.parameters(), lr=.01)
-                        accumulator = ValueGradientAccumulator(model.parameters())
+                        denominator = positive_denominator(w).item()
                         for start in range(0, n, 2):
                             end = start + 2
                             py, vy = model(x[start:end])
                             l2, l3, w = weighted_value_losses(vy, result[start:end], q[start:end], minimum)
-                            accumulator.backward(F.cross_entropy(py, labels[start:end]),
-                                                 .6*l2 + .4*l3, w, count, scaler)
-                        accumulator.finish(count)
+                            loss = F.cross_entropy(py, labels[start:end]) + (.6*l2 + .4*l3) / denominator
+                            scaler.scale(loss / count).backward()
                         scaler.unscale_(optimizer)
                         for actual, expected in zip(model.parameters(), reference.parameters()):
                             torch.testing.assert_close(actual.grad, expected.grad, atol=2e-7, rtol=2e-5)

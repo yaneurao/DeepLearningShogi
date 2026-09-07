@@ -9,7 +9,8 @@ from dlshogi.network.policy_value_network import policy_value_network
 from dlshogi import serializers
 from dlshogi.data_loader import Hcpe3DataLoader
 from dlshogi.data_loader import DataLoader
-from dlshogi.value_loss import weighted_value_losses, positive_denominator, ValueGradientAccumulator
+from dlshogi.value_loss import weighted_value_losses, positive_denominator
+from dlshogi import cppshogi
 
 
 import argparse
@@ -73,6 +74,10 @@ def main(*argv):
     args = parser.parse_args(argv)
     if not 0.0 <= args.value_loss_min_weight <= 1.0:
         parser.error('--value-loss-min-weight must be between 0 and 1')
+    if (args.value_loss_min_weight != 1.0 and args.batches_per_update > 1
+            and not hasattr(cppshogi, 'hcpe3_value_weight_mean')):
+        parser.error('Rebuild the dlshogi extension: python setup.py build_ext --inplace --force '
+                     '(required for weighted value loss with gradient accumulation)')
     if not 0.0 <= args.policy_mix <= 1.0:
         parser.error('--policy-mix must be between 0 and 1')
     if args.cache and args.policy_mix != 1.0:
@@ -415,9 +420,10 @@ def main(*argv):
                         loss1 = loss1.mean()
                     if args.beta:
                         loss1 += args.beta * (F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1).mean()
-                    loss2 = bce_with_logits_loss(y2, t2)
-                    loss3 = bce_with_logits_loss(y2, value)
-                    if args.value_loss_min_weight != 1.0:
+                    if args.value_loss_min_weight == 1.0:
+                        loss2 = bce_with_logits_loss(y2, t2)
+                        loss3 = bce_with_logits_loss(y2, value)
+                    else:
                         loss2, loss3, weight = weighted_value_losses(y2, t2, value, args.value_loss_min_weight)
                         denominator = positive_denominator(weight)
                         loss2 = loss2 / denominator
@@ -484,9 +490,12 @@ def main(*argv):
             for x1, x2, t1, t2, value in train_dataloader:
                 if accum_count == 0:
                     model.zero_grad()
-                    if args.value_loss_min_weight != 1.0:
-                        value_accumulator = ValueGradientAccumulator(model.parameters())
                     accum_target = min(args.batches_per_update, train_batch_count - micro_batches)
+                    if args.value_loss_min_weight != 1.0:
+                        value_weight_mean = train_dataloader.value_weight_mean(
+                            micro_batches * args.batchsize, accum_target * args.batchsize,
+                            args.value_loss_min_weight)
+                        value_weight_mean = value_weight_mean if value_weight_mean > 0 else 1.0
                     accum_loss1 = 0
                     accum_loss2 = 0
                     accum_loss3 = 0
@@ -507,16 +516,15 @@ def main(*argv):
                         loss1 = loss1.mean()
                     if args.beta:
                         loss1 += args.beta * (F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1).mean()
-                    loss2 = bce_with_logits_loss(y2, t2)
-                    loss3 = bce_with_logits_loss(y2, value)
+                    if args.value_loss_min_weight == 1.0:
+                        loss2 = bce_with_logits_loss(y2, t2)
+                        loss3 = bce_with_logits_loss(y2, value)
+                    else:
+                        loss2, loss3, _ = weighted_value_losses(y2, t2, value, args.value_loss_min_weight)
+                        loss2 = loss2 / value_weight_mean
+                        loss3 = loss3 / value_weight_mean
                     loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
-
-                if args.value_loss_min_weight == 1.0:
-                    scaler.scale(loss / accum_target).backward()
-                else:
-                    loss2, loss3, weight = weighted_value_losses(y2, t2, value, args.value_loss_min_weight)
-                    value_accumulator.backward(loss1, (1 - val_lambda) * loss2 + val_lambda * loss3,
-                                               weight, accum_target, scaler)
+                scaler.scale(loss / accum_target).backward()
 
                 accum_loss1 += loss1.item()
                 accum_loss2 += loss2.item()
@@ -524,11 +532,6 @@ def main(*argv):
                 accum_loss += loss.item()
 
                 if accum_count == accum_target:
-                    if args.value_loss_min_weight != 1.0:
-                        factor = value_accumulator.finish(accum_target)
-                        accum_loss2 *= factor
-                        accum_loss3 *= factor
-                        accum_loss = accum_loss1 + (1 - val_lambda) * accum_loss2 + val_lambda * accum_loss3
                     if args.clip_grad_max_norm:
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_max_norm)

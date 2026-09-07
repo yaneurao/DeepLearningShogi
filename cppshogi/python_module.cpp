@@ -541,6 +541,31 @@ void __hcpe3_decode_with_value(const size_t len, char* ndindex, char* ndfeatures
     }
 }
 
+double __hcpe3_value_weight_mean(const size_t len, const char* ndindex, double minimum) {
+    if (len == 0 || !(minimum >= 0.0 && minimum <= 1.0))
+        throw std::invalid_argument("value weight requires nonempty indices and minimum in [0, 1]");
+    const auto* index = reinterpret_cast<const size_t*>(ndindex);
+    const size_t size = cache ? __hcpe3_get_cache_num() : trainingData.size();
+    double sum = 0.0;
+    for (size_t i = 0; i < len; ++i) {
+        if (index[i] >= size)
+            throw std::out_of_range("value weight index out of range");
+        float q;
+        if (cache) {
+            const auto data = get_cache_with_lock(index[i]);
+            q = data.value / data.count;
+        } else {
+            const auto& data = trainingData[index[i]];
+            q = data.value / data.count;
+        }
+        // Same float32 target and weight as training, without decoding features.
+        const float weight = static_cast<float>(minimum)
+            + static_cast<float>((1.0 - minimum) * 4.0) * q * (1.0f - q);
+        sum += weight;
+    }
+    return sum / len;
+}
+
 // load_hcpe3で読み込み済みのtrainingDataから、インデックスを指定してhcpeを取り出す
 void __hcpe3_get_hcpe(const size_t index, char* ndhcpe) {
     HuffmanCodedPosAndEval* hcpe = reinterpret_cast<HuffmanCodedPosAndEval*>(ndhcpe);

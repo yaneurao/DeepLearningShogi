@@ -20,6 +20,7 @@ cdef extern from "python_module.h" nogil:
     void __hcpe3_decode_with_value(const size_t len, char* ndindex, char* ndfeatures1, char* ndfeatures2, char* ndprobability, char* ndresult, char* ndvalue, int decode_threads) except +
     size_t __load_evalfix(const string& filepath)
     void __hcpe3_get_hcpe(const size_t index, char* ndhcpe) except +
+    double __hcpe3_value_weight_mean(const size_t len, const char* ndindex, double minimum) except +
     void __hcpe3_prepare_evalfix(char* ndeval, char* ndresult)
     void __hcpe3_merge_cache(const string& file1, const string& file2, const string& out)
     void __hcpe3_cache_re_eval(const size_t len, char* ndindex, char* ndlogits, char* ndvalue, const float alpha_p, const float alpha_v, const float alpha_r, const float dropoff, const int limit_candidates, const float temperature) except +
@@ -61,6 +62,9 @@ def hcpe3_patch_with_hcpe(str filepath):
 
 def hcpe3_decode_with_value(np.ndarray ndindex, np.ndarray ndfeatures1, np.ndarray ndfeatures2, np.ndarray ndprobability, np.ndarray ndresult, np.ndarray ndvalue, int decode_threads=2):
     __hcpe3_decode_with_value(len(ndindex), ndindex.data, ndfeatures1.data, ndfeatures2.data, ndprobability.data, ndresult.data, ndvalue.data, decode_threads)
+
+def hcpe3_value_weight_mean(np.ndarray[np.uint64_t, ndim=1, mode='c'] ndindex, double minimum):
+    return __hcpe3_value_weight_mean(len(ndindex), ndindex.data, minimum)
 
 def hcpe3_get_hcpe(size_t index, np.ndarray ndhcpe):
     __hcpe3_get_hcpe(index, ndhcpe.data)
