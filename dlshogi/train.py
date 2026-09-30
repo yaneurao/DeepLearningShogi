@@ -66,12 +66,19 @@ def main(*argv):
     parser.add_argument('--compile_dynamic', action='store_true', help='Use dynamic=True for torch.compile')
     parser.add_argument('--use_average', action='store_true')
     parser.add_argument('--use_evalfix', action='store_true')
+    parser.add_argument('--evalfix-a', type=float,
+                        help='Fixed positive score-to-value coefficient; overrides automatic evalfix fitting.')
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--policy-mix', type=float, default=1.0,
                         help='Weight of the visit distribution versus the selected-move target (0 to 1).')
     parser.add_argument('--patch', type=str, help='Overwrite with the hcpe')
     parser.add_argument('--cache', type=str, help='training data cache file')
     args = parser.parse_args(argv)
+    if args.evalfix_a is not None:
+        if not math.isfinite(args.evalfix_a) or args.evalfix_a <= 0:
+            parser.error('--evalfix-a must be finite and > 0')
+        if args.cache or args.patch:
+            parser.error('--evalfix-a cannot be combined with --cache or --patch')
     if not 0.0 <= args.value_loss_min_weight <= 1.0:
         parser.error('--value-loss-min-weight must be between 0 and 1')
     if (args.value_loss_min_weight != 1.0 and args.batches_per_update > 1
@@ -170,7 +177,9 @@ def main(*argv):
     amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
 
-    if args.use_evalfix:
+    if args.evalfix_a is not None:
+        logging.info('use evalfix a={} (fixed)'.format(args.evalfix_a))
+    elif args.use_evalfix:
         logging.info('use evalfix')
     logging.info('temperature={}'.format(args.temperature))
     logging.info('policy_mix={}'.format(args.policy_mix))
@@ -280,7 +289,7 @@ def main(*argv):
     logging.info('optimizer {}'.format(re.sub(' +', ' ', str(optimizer).replace('\n', ''))))
 
     logging.info('Reading training data')
-    train_len, actual_len = Hcpe3DataLoader.load_files(args.train_data, args.use_average, args.use_evalfix, args.temperature, args.patch, args.cache, policy_mix=args.policy_mix)
+    train_len, actual_len = Hcpe3DataLoader.load_files(args.train_data, args.use_average, args.use_evalfix, args.temperature, args.patch, args.cache, policy_mix=args.policy_mix, evalfix_a=args.evalfix_a)
     train_data = np.arange(train_len, dtype=np.uint64)
     logging.info('Reading test data')
     test_data = np.fromfile(args.test_data, dtype=HuffmanCodedPosAndEval)

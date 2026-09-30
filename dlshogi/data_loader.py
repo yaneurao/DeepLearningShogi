@@ -188,7 +188,13 @@ class Hcpe3DataLoader(DataLoader):
         cache=None,
         logger=logging,
         policy_mix=1.0,
+        evalfix_a=None,
     ):
+        if evalfix_a is not None:
+            if not np.isfinite(evalfix_a) or evalfix_a <= 0:
+                raise ValueError("evalfix_a must be finite and > 0")
+            if cache or patch:
+                raise ValueError("evalfix_a cannot be used with cache or patch (values may use a different coefficient)")
         if not 0.0 <= policy_mix <= 1.0:
             raise ValueError("policy_mix must be between 0 and 1")
         if cache and policy_mix != 1.0:
@@ -199,13 +205,16 @@ class Hcpe3DataLoader(DataLoader):
             cache_len = cppshogi.hcpe3_load_cache(cache)
             return cache_len, cache_len
 
-        if use_evalfix:
+        if use_evalfix and evalfix_a is None:
             from scipy.optimize import curve_fit
 
         actual_len = 0
         for path in files:
             if os.path.exists(path):
-                if use_evalfix:
+                if evalfix_a is not None:
+                    a = evalfix_a
+                    logger.info("{}, a={} (fixed)".format(path, a))
+                elif use_evalfix:
                     eval, result = cppshogi.hcpe3_prepare_evalfix(path)
                     if (eval == 0).all():
                         a = 0

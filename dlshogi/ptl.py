@@ -74,10 +74,12 @@ class Hcpe3Dataset(Dataset):
         patch,
         cache,
         decode_threads=2,
+        evalfix_a=None,
     ):
         self.files = files
         self.use_average = use_average
         self.use_evalfix = use_evalfix
+        self.evalfix_a = evalfix_a
         self.temperature = temperature
         self.patch = patch
         self.cache = cache
@@ -97,6 +99,7 @@ class Hcpe3Dataset(Dataset):
             self.patch,
             self.cache,
             logger,
+            evalfix_a=self.evalfix_a,
         )
         self.loaded_pid = os.getpid()
         self.loaded_worker_id = None
@@ -182,6 +185,7 @@ class DataModule(pl.LightningDataModule):
         num_workers=None,
         prefetch_factor=None,
         persistent_workers=None,
+        evalfix_a=None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -215,6 +219,7 @@ class DataModule(pl.LightningDataModule):
                 if self.hparams.get("num_workers") is not None
                 and self.hparams.num_workers > 0
                 else 2,
+                evalfix_a=self.hparams.get("evalfix_a"),
             )
             self.val_dataset = HcpeDataset(self.hparams.val_files)
 
