@@ -23,6 +23,10 @@ import math
 
 import logging
 
+def warmup_lr(start, end, index, updates):
+    fraction = index / (updates - 1) if updates > 1 else 1.0
+    return start + (end - start) * fraction
+
 def main(*argv):
     parser = argparse.ArgumentParser(description='Train policy value network')
     parser.add_argument('train_data', type=str, nargs='+', help='training data file')
@@ -41,6 +45,7 @@ def main(*argv):
     parser.add_argument('--optimizer', default='SGD(momentum=0.9,nesterov=True)', help='optimizer')
     parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay rate')
+    parser.add_argument('--lr-warmup', type=float, help='Initial LR for linear warmup during the first epoch of this invocation')
     parser.add_argument('--lr_scheduler', help='learning rate scheduler')
     parser.add_argument('--scheduler_step_mode', type=str, default='epoch', choices=['epoch', 'step'], help='Scheduler step mode: epoch or step')
     parser.add_argument('--reset_scheduler', action='store_true')
@@ -102,6 +107,10 @@ def main(*argv):
         logging.info('batches_per_update={}, effective_batchsize={}'.format(args.batches_per_update, args.batchsize * args.batches_per_update))
     logging.info('lr={}'.format(args.lr))
     logging.info('weight_decay={}'.format(args.weight_decay))
+    if args.lr_warmup is not None and (not math.isfinite(args.lr_warmup)
+                                       or not math.isfinite(args.lr)
+                                       or not 0 <= args.lr_warmup <= args.lr):
+        parser.error('--lr-warmup requires 0 <= lr-warmup <= lr (finite)')
     if args.lr_scheduler:
         logging.info('lr_scheduler {}'.format(args.lr_scheduler))
     if args.use_critic:
@@ -396,8 +405,27 @@ def main(*argv):
     sum_loss = 0
     eval_interval = args.eval_interval
     for e in range(args.epoch):
+        warming_up = args.lr_warmup is not None and e == 0
+        warmup_index = 0
+        if warming_up:
+            batch_count = len(train_data) // args.batchsize
+            warmup_updates = (batch_count + args.batches_per_update - 1) // args.batches_per_update
+            if warmup_updates == 0:
+                raise ValueError('LR warmup requires at least one full mini-batch')
+            logging.info('lr warmup start=%s end=%s updates=%s',
+                         args.lr_warmup, args.lr, warmup_updates)
+            for group in optimizer.param_groups:
+                group['lr'] = warmup_lr(args.lr_warmup, args.lr, 0, warmup_updates)
+
+        def apply_warmup_lr():
+            nonlocal warmup_index
+            lr = warmup_lr(args.lr_warmup, args.lr, warmup_index, warmup_updates)
+            for group in optimizer.param_groups:
+                group['lr'] = lr
+            warmup_index += 1
+
         if args.lr_scheduler:
-            logging.info('lr_scheduler lr={}'.format(scheduler.get_last_lr()[0]))
+            logging.info('lr_scheduler lr={}'.format(optimizer.param_groups[0]['lr']))
         if args.val_lambda_decay_epoch:
             # update val_lambda
             val_lambda = max(
@@ -443,6 +471,8 @@ def main(*argv):
                 if args.clip_grad_max_norm:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_max_norm)
+                if warming_up:
+                    apply_warmup_lr()
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -485,7 +515,7 @@ def main(*argv):
                     sum_loss3 = 0
                     sum_loss = 0
 
-                if args.lr_scheduler and args.scheduler_step_mode == 'step':
+                if args.lr_scheduler and args.scheduler_step_mode == 'step' and not warming_up:
                     scheduler.step()
         else:
             train_batch_count = len(train_data) // args.batchsize
@@ -544,6 +574,8 @@ def main(*argv):
                     if args.clip_grad_max_norm:
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_max_norm)
+                    if warming_up:
+                        apply_warmup_lr()
                     scaler.step(optimizer)
                     scaler.update()
 
@@ -588,7 +620,7 @@ def main(*argv):
                         sum_loss3 = 0
                         sum_loss = 0
 
-                    if args.lr_scheduler and args.scheduler_step_mode == 'step':
+                    if args.lr_scheduler and args.scheduler_step_mode == 'step' and not warming_up:
                         scheduler.step()
 
                     accum_count = 0
@@ -613,7 +645,7 @@ def main(*argv):
             test_accuracy1, test_accuracy2,
             test_entropy1, test_entropy2))
 
-        if args.lr_scheduler and args.scheduler_step_mode == 'epoch':
+        if args.lr_scheduler and args.scheduler_step_mode == 'epoch' and not warming_up:
             scheduler.step()
 
         # save checkpoint
