@@ -6,6 +6,7 @@ from torch.optim.swa_utils import AveragedModel, update_bn
 
 from dlshogi.common import *
 from dlshogi.network.policy_value_network import policy_value_network
+from dlshogi.optim import build_optimizer
 from dlshogi import serializers
 from dlshogi.data_loader import Hcpe3DataLoader
 from dlshogi.data_loader import DataLoader
@@ -22,6 +23,16 @@ import importlib
 import math
 
 import logging
+
+def resolve_spec(spec, default_module):
+    if not spec.endswith(')'):
+        spec += '()'
+    name, arguments = spec.split('(', 1)
+    kwargs = eval(f'dict({arguments[:-1]})', globals())
+    if '.' in name:
+        module_name, name = name.rsplit('.', 1)
+        default_module = importlib.import_module(module_name)
+    return getattr(default_module, name), kwargs
 
 def warmup_lr(start, end, index, updates):
     fraction = index / (updates - 1) if updates > 1 else 1.0
@@ -43,9 +54,12 @@ def main(*argv):
     parser.add_argument('--initmodel', '-m', default='', help='Initialize the model from given file (for compatibility)')
     parser.add_argument('--log', help='log file path')
     parser.add_argument('--optimizer', default='SGD(momentum=0.9,nesterov=True)', help='optimizer')
+    parser.add_argument('--param_optimizer', action='append', default=[], metavar='TAG=OPTIMIZER')
+    parser.add_argument('--activation-checkpoint', action='store_true', help='Recompute exp__by blocks during backward to reduce GPU memory')
     parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay rate')
     parser.add_argument('--lr-warmup', type=float, help='Initial LR for linear warmup during the first epoch of this invocation')
+    parser.add_argument('--lr-warmup-end', type=float, help='End LR for this invocation warmup (defaults to --lr)')
     parser.add_argument('--lr_scheduler', help='learning rate scheduler')
     parser.add_argument('--scheduler_step_mode', type=str, default='epoch', choices=['epoch', 'step'], help='Scheduler step mode: epoch or step')
     parser.add_argument('--reset_scheduler', action='store_true')
@@ -111,6 +125,9 @@ def main(*argv):
                                        or not math.isfinite(args.lr)
                                        or not 0 <= args.lr_warmup <= args.lr):
         parser.error('--lr-warmup requires 0 <= lr-warmup <= lr (finite)')
+    if args.lr_warmup_end is not None and (args.lr_warmup is None or not math.isfinite(args.lr_warmup_end)
+                                           or not args.lr_warmup <= args.lr_warmup_end <= args.lr):
+        parser.error('--lr-warmup-end requires lr-warmup <= lr-warmup-end <= lr')
     if args.lr_scheduler:
         logging.info('lr_scheduler {}'.format(args.lr_scheduler))
     if args.use_critic:
@@ -127,29 +144,31 @@ def main(*argv):
         device = torch.device("cpu")
 
     model = policy_value_network(args.network)
+    if args.activation_checkpoint:
+        if args.use_compile:
+            parser.error('--activation-checkpoint cannot currently be combined with --use_compile')
+        if not hasattr(model, 'activation_checkpoint'):
+            parser.error('--activation-checkpoint is supported for exp__by models only')
+        model.activation_checkpoint = True
     model.to(device)
 
-    def create_optimizer(optimizer_str, model_params, lr, weight_decay):
-        optimizer_name, optimizer_args = optimizer_str.split('(', 1)
-        optimizer_args = eval(f'dict({optimizer_args.rstrip(")")})')
-        if '.' in optimizer_name:
-            module_name, class_name = optimizer_name.rsplit('.', 1)
-            module = importlib.import_module(module_name)
-            optimizer_class = getattr(module, class_name)
-        else:
-            optimizer_class = getattr(optim, optimizer_name)
-
-        if weight_decay >= 0:
-            optimizer_args["weight_decay"] = weight_decay
-
-        optimizer = optimizer_class(model_params, lr=lr, **optimizer_args)
+    def create_optimizer(spec, model_params):
+        optimizer_class, optimizer_args = resolve_spec(spec, optim)
+        optimizer_args.setdefault('lr', args.lr)
+        if args.weight_decay >= 0:
+            optimizer_args.setdefault('weight_decay', args.weight_decay)
+        optimizer = optimizer_class(model_params, **optimizer_args)
         if not isinstance(optimizer, torch.optim.Optimizer):
             raise TypeError(f"Invalid optimizer type: {type(optimizer)}. Must be a subclass of torch.optim.Optimizer")
         return optimizer
 
-    if args.optimizer[-1] != ')':
-        args.optimizer += '()'
-    optimizer = create_optimizer(args.optimizer, model.parameters(), args.lr, args.weight_decay)
+    routes = {}
+    for route in args.param_optimizer:
+        tag, _, spec = route.partition('=')
+        if not tag.isidentifier() or not spec or tag in routes:
+            parser.error(f'invalid or duplicate --param_optimizer: {route}')
+        routes[tag] = spec
+    optimizer = build_optimizer(model, create_optimizer, args.optimizer, routes)
 
     def create_scheduler(scheduler_str, optimizer):
         scheduler_name, scheduler_args = scheduler_str.split('(', 1)
@@ -281,6 +300,10 @@ def main(*argv):
             and compile_mode in ('reduce-overhead', 'max-autotune')
         )
 
+        for module in model.modules():
+            hook = getattr(module, 'set_compile_backend', None)
+            if hook is not None:
+                hook(compile_backend or 'inductor')
         logging.info('use torch.compile({})'.format(', '.join(f'{key}={value}' for key, value in compile_kwargs.items())))
         compiled_model = torch.compile(model, **compile_kwargs)
 
@@ -406,6 +429,7 @@ def main(*argv):
     eval_interval = args.eval_interval
     for e in range(args.epoch):
         warming_up = args.lr_warmup is not None and e == 0
+        warmup_end = args.lr if args.lr_warmup_end is None else args.lr_warmup_end
         warmup_index = 0
         if warming_up:
             batch_count = len(train_data) // args.batchsize
@@ -413,13 +437,13 @@ def main(*argv):
             if warmup_updates == 0:
                 raise ValueError('LR warmup requires at least one full mini-batch')
             logging.info('lr warmup start=%s end=%s updates=%s',
-                         args.lr_warmup, args.lr, warmup_updates)
+                         args.lr_warmup, warmup_end, warmup_updates)
             for group in optimizer.param_groups:
-                group['lr'] = warmup_lr(args.lr_warmup, args.lr, 0, warmup_updates)
+                group['lr'] = warmup_lr(args.lr_warmup, warmup_end, 0, warmup_updates)
 
         def apply_warmup_lr():
             nonlocal warmup_index
-            lr = warmup_lr(args.lr_warmup, args.lr, warmup_index, warmup_updates)
+            lr = warmup_lr(args.lr_warmup, warmup_end, warmup_index, warmup_updates)
             for group in optimizer.param_groups:
                 group['lr'] = lr
             warmup_index += 1

@@ -61,6 +61,7 @@ def main(*argv):
 
     if args.fixed_batchsize is None:
         torch.onnx.export(model, (x1, x2), args.onnx,
+            dynamo = False,
             verbose = True,
             do_constant_folding = True,
             input_names = ['input1', 'input2'],
@@ -73,6 +74,7 @@ def main(*argv):
                 })
     else:
         torch.onnx.export(model, (x1, x2), args.onnx,
+            dynamo = False,
             verbose = True,
             do_constant_folding = True,
             input_names = ['input1', 'input2'],
