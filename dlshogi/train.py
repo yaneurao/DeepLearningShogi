@@ -58,7 +58,8 @@ def main(*argv):
     parser.add_argument('--activation-checkpoint', action='store_true', help='Recompute exp__by blocks during backward to reduce GPU memory')
     parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay rate')
-    parser.add_argument('--lr-warmup', type=float, help='Initial LR for linear warmup during the first epoch of this invocation')
+    parser.add_argument('--lr-warmup', type=float, nargs='?', const=1e-7,
+                        help='Initial LR for first-epoch warmup (bare flag: 1e-7; omitted: disabled)')
     parser.add_argument('--lr-warmup-end', type=float, help='End LR for this invocation warmup (defaults to --lr)')
     parser.add_argument('--lr_scheduler', help='learning rate scheduler')
     parser.add_argument('--scheduler_step_mode', type=str, default='epoch', choices=['epoch', 'step'], help='Scheduler step mode: epoch or step')
