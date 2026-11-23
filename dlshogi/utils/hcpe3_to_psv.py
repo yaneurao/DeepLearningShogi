@@ -31,27 +31,22 @@ parser.add_argument('--use_evalfix', action='store_true')
 parser.add_argument('--eval_coef', type=float, default=600.0)
 args = parser.parse_args()
 
-def score_to_value(score, a):
-    return 1.0 / (1.0 + np.exp(-score / a))
-
 def load_hcpe3(path, use_evalfix=False, eval_coef=600.0):
+    offset = 0.0
     if use_evalfix:
-        from scipy.optimize import curve_fit
-
-    if use_evalfix:
+        from dlshogi.evalfix import fit_evalfix
         eval, result = cppshogi.hcpe3_prepare_evalfix(path)
-        if (eval == 0).all():
-            a = 0
+        a, offset = fit_evalfix(eval, result)
+        if a == 0:
             logging.info('{}, skip evalfix'.format(path))
         else:
-            popt, _ = curve_fit(score_to_value, eval, result, p0=[300.0])
-            a = popt[0]
-            print(f'a={a}')
+            print(f'a={a}, offset={offset}')
     else:
         a = eval_coef
     # cppshogi.load_hcpe3の内部で756.0864962951762を基準にしているため調整
     a *= 756.0864962951762 / eval_coef
-    sum_len, len_ = cppshogi.load_hcpe3(path, False, a, 1.0)
+    offset *= eval_coef / 756.0864962951762
+    sum_len, len_ = cppshogi.load_hcpe3(path, False, a, 1.0, 1.0, offset)
     if len_ == 0:
         raise RuntimeError('read error')
     return sum_len, len_

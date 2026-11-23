@@ -236,8 +236,15 @@ TrainingData get_cache_with_lock(const size_t i) {
     return TrainingData(buf.body, buf.candidates, candidateNum);
 }
 
+static float calibrated_value(const Score score, double scale, double offset) {
+    if (scale == 1.0 && offset == 0.0)
+        return score_to_value(score);
+    // Avoid integer rounding/overflow after affine calibration.
+    return static_cast<float>(1.0 / (1.0 + std::exp(-(score * scale + offset) / 756.0864962951762)));
+}
+
 // hcpe形式の指し手をone-hotの方策として読み込む
-size_t load_hcpe(const std::string& filepath, std::ifstream& ifs, bool use_average, const double eval_scale, size_t& len) {
+size_t load_hcpe(const std::string& filepath, std::ifstream& ifs, bool use_average, const double eval_scale, size_t& len, double eval_offset) {
     for (int p = 0; ifs; ++p) {
         HuffmanCodedPosAndEval hcpe;
         ifs.read((char*)&hcpe, sizeof(HuffmanCodedPosAndEval));
@@ -245,7 +252,7 @@ size_t load_hcpe(const std::string& filepath, std::ifstream& ifs, bool use_avera
             break;
         }
 
-        const float value = score_to_value((Score)(hcpe.eval * eval_scale));
+        const float value = calibrated_value((Score)hcpe.eval, eval_scale, eval_offset);
         if (use_average) {
             auto ret = duplicates.emplace(hcpe.hcp, trainingData.size());
             if (ret.second) {
@@ -368,7 +375,7 @@ bool is_hcpe(std::ifstream& ifs) {
 
 // hcpe3形式のデータを読み込み、ランダムアクセス可能なように加工し、trainingDataに保存する
 // 複数回呼ぶことで、複数ファイルの読み込みが可能
-size_t __load_hcpe3(const std::string& filepath, bool use_average, double a, double temperature, size_t& len, double policy_mix) {
+size_t __load_hcpe3(const std::string& filepath, bool use_average, double a, double temperature, size_t& len, double policy_mix, double eval_offset) {
     std::ifstream ifs(filepath, std::ifstream::binary | std::ios::ate);
     if (!ifs) return trainingData.size();
 
@@ -378,7 +385,7 @@ size_t __load_hcpe3(const std::string& filepath, bool use_average, double a, dou
     // hcpeの場合は、指し手をone-hotの方策として読み込む
     if (is_hcpe(ifs)) {
         ifs.seekg(std::ios_base::beg);
-        return load_hcpe(filepath, ifs, use_average, eval_scale, len);
+        return load_hcpe(filepath, ifs, use_average, eval_scale, len, eval_offset);
     }
     ifs.seekg(std::ios_base::beg);
 
@@ -417,7 +424,7 @@ size_t __load_hcpe3(const std::string& filepath, bool use_average, double a, dou
                 const auto draw = pos.moveIsDraw(move, 16);
                 if (draw != RepetitionDraw && draw != RepetitionSuperior && draw != RepetitionInferior) {
                     const auto hcp = pos.toHuffmanCodedPos();
-                    const float value = score_to_value((Score)(moveInfo.eval * eval_scale));
+                    const float value = calibrated_value((Score)moveInfo.eval, eval_scale, eval_offset);
                     if (use_average) {
                         auto ret = duplicates.emplace(hcp, trainingData.size());
                         if (ret.second) {

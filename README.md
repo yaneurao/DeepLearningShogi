@@ -14,6 +14,25 @@ http://tadaoyamaoka.hatenablog.com/
 
 最新のモデルファイルは、[棋神アナリティクス](https://kishin-analytics.heroz.jp/lp/)でご利用いただけます。
 
+## 教師評価値の補正（evalfix）
+
+`python -m dlshogi.train ... --use_evalfix` は、HCPE/HCPE3ファイルごとに
+勝敗結果から倍率とoffsetを推定し、`補正後eval = eval * scale + offset` として
+教師valueを補正します。オプション名は従来のままです。
+
+手番側基準の勝敗（勝ち1、引き分け0.5、負け0）と
+`sigmoid(補正後eval / 756.0864962951762)` の二乗誤差を最小化します。
+倍率は正に制限します。推定対象が空、または評価値がすべて同じファイルは補正をスキップします。
+ログには `a`, `scale`, `offset` を出力し、`scale = 756.0864962951762 / a` です。
+推定時の詰み評価値除外は従来どおりです。
+
+`--evalfix-a 600` のような固定係数指定は自動推定より優先し、offsetは0です。
+policy教師、勝敗教師、テストデータ、入力ファイル自体は変更しません。
+学習で補正後valueを利用する割合は引き続き `--val_lambda` で決まります。
+
+更新後はC++拡張も再ビルドしてください（`python setup.py build_ext --inplace`）。
+既存の教師キャッシュには補正済みvalueが保存されているため、新方式を使うには再生成が必要です。
+
 ## Value lossの重み付け
 
 `dlshogi.train --value-loss-min-weight 0.5`は、教師評価値から変換された期待勝率`q`に応じて

@@ -206,27 +206,30 @@ class Hcpe3DataLoader(DataLoader):
             return cache_len, cache_len
 
         if use_evalfix and evalfix_a is None:
-            from scipy.optimize import curve_fit
+            from dlshogi.evalfix import fit_evalfix
 
         actual_len = 0
         for path in files:
             if os.path.exists(path):
+                eval_offset = 0.0
                 if evalfix_a is not None:
                     a = evalfix_a
                     logger.info("{}, a={} (fixed)".format(path, a))
                 elif use_evalfix:
                     eval, result = cppshogi.hcpe3_prepare_evalfix(path)
-                    if (eval == 0).all():
-                        a = 0
+                    a, eval_offset = fit_evalfix(eval, result)
+                    if a == 0:
                         logger.info("{}, skip evalfix".format(path))
                     else:
-                        popt, _ = curve_fit(score_to_value, eval, result, p0=[300.0])
-                        a = popt[0]
-                        logger.info("{}, a={}".format(path, a))
+                        logger.info("{}, a={}, scale={}, offset={}".format(
+                            path, a, 756.0864962951762 / a, eval_offset))
                 else:
                     a = 0
                     logger.info(path)
-                if policy_mix == 1.0:
+                if use_evalfix and evalfix_a is None:
+                    sum_len, len_ = cppshogi.load_hcpe3(
+                        path, use_average, a, temperature, policy_mix, eval_offset)
+                elif policy_mix == 1.0:
                     sum_len, len_ = cppshogi.load_hcpe3(path, use_average, a, temperature)
                 else:
                     sum_len, len_ = cppshogi.load_hcpe3(path, use_average, a, temperature, policy_mix)

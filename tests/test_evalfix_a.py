@@ -40,16 +40,17 @@ class EvalfixATest(unittest.TestCase):
             self.cpp.load_hcpe3.assert_called_with(f.name, False, 0, 1.0)
 
     def test_unspecified_on_still_fits(self):
-        import types
-        import sys
-        curve = Mock(return_value=([150.0], None))
-        optimize = types.ModuleType('scipy.optimize')
-        optimize.curve_fit = curve
         self.cpp.hcpe3_prepare_evalfix.return_value = (np.array([1, 2]), np.array([0, 1]))
-        with patch.dict(sys.modules, {'scipy.optimize': optimize}), tempfile.NamedTemporaryFile() as f:
+        with patch('dlshogi.evalfix.fit_evalfix', return_value=(150.0, -80.0)) as fit, tempfile.NamedTemporaryFile() as f:
             self.load([f.name], use_evalfix=True)
-            curve.assert_called_once()
-            self.cpp.load_hcpe3.assert_called_with(f.name, False, 150.0, 1.0)
+            fit.assert_called_once()
+            self.cpp.load_hcpe3.assert_called_with(f.name, False, 150.0, 1.0, 1.0, -80.0)
+
+    def test_auto_keeps_policy_mix(self):
+        self.cpp.hcpe3_prepare_evalfix.return_value = (np.array([1, 2]), np.array([0, 1]))
+        with patch('dlshogi.evalfix.fit_evalfix', return_value=(600.0, 90.0)), tempfile.NamedTemporaryFile() as f:
+            self.load([f.name], use_evalfix=True, policy_mix=0.25)
+            self.cpp.load_hcpe3.assert_called_with(f.name, False, 600.0, 1.0, 0.25, 90.0)
 
     def test_validation(self):
         for value in (0, -1, float('nan'), float('inf')):
